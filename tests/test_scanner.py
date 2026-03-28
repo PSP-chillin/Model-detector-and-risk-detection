@@ -371,5 +371,189 @@ class TestReporter(unittest.TestCase):
         self.assertEqual(severities, ["HIGH", "MEDIUM", "LOW"])
 
 
+# ---------------------------------------------------------------------------
+# VirusTotalScanner tests (HTTP calls fully mocked)
+# ---------------------------------------------------------------------------
+
+from unittest.mock import MagicMock, patch
+
+from ml_scanner.virustotal_scanner import VirusTotalScanner, _risk_severity
+
+
+class TestRiskSeverity(unittest.TestCase):
+    """Unit tests for the pure _risk_severity() helper."""
+
+    def test_high_many_malicious(self):
+        self.assertEqual(_risk_severity({"malicious": 10, "harmless": 50}), "HIGH")
+
+    def test_high_ratio(self):
+        # 4 / 10 = 0.40 > 0.30 → HIGH
+        self.assertEqual(_risk_severity({"malicious": 4, "harmless": 6}), "HIGH")
+
+    def test_medium_some_malicious(self):
+        self.assertEqual(_risk_severity({"malicious": 1, "harmless": 60}), "MEDIUM")
+
+    def test_medium_many_suspicious(self):
+        self.assertEqual(_risk_severity({"malicious": 0, "suspicious": 5, "harmless": 55}), "MEDIUM")
+
+    def test_low_few_suspicious(self):
+        self.assertEqual(_risk_severity({"malicious": 0, "suspicious": 1, "harmless": 60}), "LOW")
+
+    def test_clean_returns_none(self):
+        self.assertIsNone(_risk_severity({"malicious": 0, "suspicious": 0, "harmless": 70}))
+
+    def test_empty_stats_returns_none(self):
+        self.assertIsNone(_risk_severity({}))
+
+
+class TestVirusTotalScannerInit(unittest.TestCase):
+    def test_empty_key_raises(self):
+        with self.assertRaises(ValueError):
+            VirusTotalScanner(api_key="")
+
+
+class TestVirusTotalScannerAnalyzeFile(unittest.TestCase):
+    """Integration-style tests that mock the requests library."""
+
+    def _make_scanner(self):
+        return VirusTotalScanner(api_key="testapikey")
+
+    def _hash_response(self, stats):
+        """Build a fake VT /files/{hash} response."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "data": {
+                "attributes": {
+                    "last_analysis_stats": stats,
+                }
+            }
+        }
+        mock_resp.raise_for_status = MagicMock()
+        return mock_resp
+
+    def _not_found_response(self):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 404
+        mock_resp.raise_for_status = MagicMock()
+        return mock_resp
+
+    def _upload_response(self, analysis_id="analysis123"):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"data": {"id": analysis_id}}
+        mock_resp.raise_for_status = MagicMock()
+        return mock_resp
+
+    def _analysis_completed_response(self, stats):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "data": {
+                "attributes": {
+                    "status": "completed",
+                    "stats": stats,
+                }
+            }
+        }
+        mock_resp.raise_for_status = MagicMock()
+        return mock_resp
+
+    @patch("ml_scanner.virustotal_scanner.requests.get")
+    def test_clean_file_returns_no_findings(self, mock_get):
+        mock_get.return_value = self._hash_response(
+            {"malicious": 0, "suspicious": 0, "harmless": 70, "undetected": 10}
+        )
+        scanner = self._make_scanner()
+        path = _write_tmp("# clean python file\n")
+        try:
+            findings = scanner.analyze_file(path)
+            self.assertEqual(findings, [])
+        finally:
+            os.unlink(path)
+
+    @patch("ml_scanner.virustotal_scanner.requests.get")
+    def test_high_severity_finding(self, mock_get):
+        mock_get.return_value = self._hash_response(
+            {"malicious": 15, "suspicious": 2, "harmless": 50, "undetected": 3}
+        )
+        scanner = self._make_scanner()
+        path = _write_tmp("# malware\n")
+        try:
+            findings = scanner.analyze_file(path)
+            self.assertEqual(len(findings), 1)
+            self.assertEqual(findings[0]["severity"], "HIGH")
+            self.assertIn("VirusTotal", findings[0]["issue"])
+            self.assertIn("15/", findings[0]["issue"])
+        finally:
+            os.unlink(path)
+
+    @patch("ml_scanner.virustotal_scanner.requests.get")
+    def test_medium_severity_finding(self, mock_get):
+        mock_get.return_value = self._hash_response(
+            {"malicious": 1, "suspicious": 0, "harmless": 60, "undetected": 9}
+        )
+        scanner = self._make_scanner()
+        path = _write_tmp("# suspicious\n")
+        try:
+            findings = scanner.analyze_file(path)
+            self.assertEqual(len(findings), 1)
+            self.assertEqual(findings[0]["severity"], "MEDIUM")
+        finally:
+            os.unlink(path)
+
+    @patch("ml_scanner.virustotal_scanner.requests.get")
+    def test_low_severity_finding(self, mock_get):
+        mock_get.return_value = self._hash_response(
+            {"malicious": 0, "suspicious": 2, "harmless": 60, "undetected": 8}
+        )
+        scanner = self._make_scanner()
+        path = _write_tmp("# slightly suspicious\n")
+        try:
+            findings = scanner.analyze_file(path)
+            self.assertEqual(len(findings), 1)
+            self.assertEqual(findings[0]["severity"], "LOW")
+        finally:
+            os.unlink(path)
+
+    @patch("ml_scanner.virustotal_scanner.requests.post")
+    @patch("ml_scanner.virustotal_scanner.requests.get")
+    def test_hash_not_found_triggers_upload(self, mock_get, mock_post):
+        """When hash lookup returns 404, the file should be uploaded."""
+        # First GET → 404 (hash not found)
+        # Second GET → analysis completed
+        mock_get.side_effect = [
+            self._not_found_response(),
+            self._analysis_completed_response(
+                {"malicious": 5, "suspicious": 0, "harmless": 55, "undetected": 10}
+            ),
+        ]
+        mock_post.return_value = self._upload_response("analysis-abc")
+
+        scanner = self._make_scanner()
+        path = _write_tmp("# unknown file\n")
+        try:
+            findings = scanner.analyze_file(path)
+            self.assertTrue(mock_post.called, "File should have been uploaded")
+            self.assertEqual(len(findings), 1)
+            self.assertEqual(findings[0]["severity"], "HIGH")
+        finally:
+            os.unlink(path)
+
+    @patch("ml_scanner.virustotal_scanner.requests.get")
+    def test_network_error_returns_low_finding(self, mock_get):
+        import requests as req_lib
+        mock_get.side_effect = req_lib.exceptions.ConnectionError("connection refused")
+        scanner = self._make_scanner()
+        path = _write_tmp("# file\n")
+        try:
+            findings = scanner.analyze_file(path)
+            self.assertEqual(len(findings), 1)
+            self.assertEqual(findings[0]["severity"], "LOW")
+            self.assertIn("VirusTotal scan error", findings[0]["issue"])
+        finally:
+            os.unlink(path)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -14,6 +14,7 @@ from .pattern_engine import PatternEngine
 from .bandit_runner import BanditRunner
 from .api_scanner import APIScanner
 from .reporter import Reporter
+from .virustotal_scanner import VirusTotalScanner
 
 __all__ = [
     "ASTAnalyzer",
@@ -21,4 +22,5 @@ __all__ = [
     "BanditRunner",
     "APIScanner",
     "Reporter",
+    "VirusTotalScanner",
 ]

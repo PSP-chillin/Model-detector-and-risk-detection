@@ -7,13 +7,15 @@ Scans Python files / directories for common ML-codebase vulnerabilities.
 Usage:
     python scan.py <path> [--output report.json] [--no-bandit] [--severity HIGH]
 
-    <path>           File or directory to scan (required)
-    --output / -o    Write JSON report to this file (default: stdout)
-    --no-bandit      Skip bandit extended-rules scan
-    --severity / -s  Minimum severity to include in output [HIGH|MEDIUM|LOW]
-                     (default: LOW – show all)
-    --api-scan       Enable API endpoint security checks (on by default)
-    --no-api-scan    Disable API endpoint security checks
+    <path>                File or directory to scan (required)
+    --output / -o         Write JSON report to this file (default: stdout)
+    --no-bandit           Skip bandit extended-rules scan
+    --severity / -s       Minimum severity to include in output [HIGH|MEDIUM|LOW]
+                          (default: LOW – show all)
+    --api-scan            Enable API endpoint security checks (on by default)
+    --no-api-scan         Disable API endpoint security checks
+    --virustotal-key KEY  VirusTotal API key; enables file submission for
+                          malware / risk detection (disabled by default)
 """
 
 import argparse
@@ -27,6 +29,7 @@ from ml_scanner.ast_analyzer import ASTAnalyzer
 from ml_scanner.pattern_engine import PatternEngine
 from ml_scanner.bandit_runner import BanditRunner
 from ml_scanner.api_scanner import APIScanner
+from ml_scanner.virustotal_scanner import VirusTotalScanner
 from ml_scanner.reporter import Reporter
 
 
@@ -54,6 +57,12 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         default=False,
         help="Disable API endpoint security scanning",
+    )
+    parser.add_argument(
+        "--virustotal-key",
+        metavar="KEY",
+        default=None,
+        help="VirusTotal API key – enables malware/risk detection via the VT v3 API",
     )
     parser.add_argument(
         "--severity", "-s",
@@ -112,6 +121,18 @@ def main() -> int:
             reporter.add_findings(api_scanner.analyze_directory(target))
         else:
             reporter.add_findings(api_scanner.analyze_file(target))
+
+    # 5. VirusTotal risk detection
+    if args.virustotal_key:
+        print(f"[*] Running VirusTotal scan on {target} ...", file=sys.stderr)
+        vt_scanner = VirusTotalScanner(api_key=args.virustotal_key)
+        if vt_scanner.available():
+            if is_dir:
+                reporter.add_findings(vt_scanner.analyze_directory(target))
+            else:
+                reporter.add_findings(vt_scanner.analyze_file(target))
+        else:
+            print("[!] 'requests' not found – install with: pip install requests", file=sys.stderr)
 
     # Apply severity filter
     reporter.filter_by_severity(args.severity)
